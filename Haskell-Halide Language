@@ -1,0 +1,254 @@
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE Strict #-}
+
+module Halide.HazardPanels where
+
+-- IMPORTS CORRETOS
+import Control.Concurrent (forkIO, threadDelay, myThreadId)
+import Control.Monad (forM_, forever, when)
+import Data.Array (Array, (!), listArray, indices, elems)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Word (Word32, Word64)
+import Data.Set (Set, member, insert, empty, foldl')
+import GHC.Conc (getNumCapabilities, getCurrentCapability)
+import System.Mem (performGC)
+import System.Mem.Weak (addFinalizer)
+import Unsafe.Coerce (unsafeCoerce)
+import Data.Typeable (Typeable)
+import Control.Exception (bracket)
+import Text.Printf (printf)
+
+-- ================================================================
+-- CORE TYPES
+-- ================================================================
+
+-- | Hazard Pointer (o que o usuário vê)
+newtype HazardPtr a = HazardPtr (SmartPtr a)
+
+-- | Smart pointer (implementação interna)
+data SmartPtr a = SmartPtr
+    { spRef   :: !(IORef a)
+    , spStamp :: !Word32
+    , spPanel :: !Int
+    }
+
+-- | Retired node
+data RetiredNode a = RetiredNode
+    { rnPtr   :: !(SmartPtr a)  -- Mudamos de HazardPtr para SmartPtr
+    , rnEra   :: !Word64
+    , rnStamp :: !Word32
+    } deriving (Show, Eq)
+
+-- | Hazard Panel (um por core)
+data HazardPanel a = HazardPanel
+    { hpRetiredList :: !(IORef [RetiredNode a])
+    , hpLocalEra    :: !(IORef Word64)
+    , hpActiveFlags :: !(IORef [AtomicFlag a])  -- Tipo correto
+    , hpStamp       :: !(IORef Word32)
+    , hpCoreId      :: !Int
+    }
+
+-- | Atomic Flag
+data AtomicFlag a = AtomicFlag
+    { afPtr    :: !(AtomicSmartPtr a)
+    , afStamp  :: !Word32
+    , afActive :: !(IORef Bool)
+    }
+
+-- | Atomic Smart Pointer
+data AtomicSmartPtr a = AtomicSmartPtr
+    { aspRef   :: !(IORef a)
+    , aspStamp :: !Word32
+    , aspPanel :: !Int
+    }
+
+-- ================================================================
+-- GLOBAL STATE
+-- ================================================================
+
+panels :: Array Int (HazardPanel ())
+panels = unsafePerformIO $ do
+    n <- getNumCapabilities
+    panelList <- forM [0..n-1] $ \i -> do
+        retired <- newIORef []
+        era <- newIORef 0
+        flags <- newIORef []
+        stamp <- newIORef 0
+        return $ HazardPanel retired era flags stamp i
+    return $ listArray (0, n-1) panelList
+{-# NOINLINE panels #-}
+
+-- ================================================================
+-- OPERAÇÕES
+-- ================================================================
+
+getCurrentPanel :: IO (HazardPanel a)
+getCurrentPanel = do
+    cap <- getCurrentCapability
+    let coreId = fromIntegral cap
+    let panel = panels ! coreId
+    return (unsafeCoerce panel)
+
+-- | Verifica se o ponteiro está vivo
+isPtrAlive :: SmartPtr a -> IO Bool
+isPtrAlive ptr = do
+    panel <- getCurrentPanel
+    retired <- readIORef (hpRetiredList panel)
+    let isRetired = any (\n -> rnStamp n == spStamp ptr) retired
+    return (not isRetired)
+
+-- | Cria um novo ponteiro
+newSmartPtr :: a -> IO (SmartPtr a)
+newSmartPtr value = do
+    panel <- getCurrentPanel
+    ref <- newIORef value
+    stamp <- atomicModifyIORef' (hpStamp panel) $ \s -> (s + 1, s)
+    let ptr = SmartPtr ref stamp (hpCoreId panel)
+    addFinalizer ptr $ retirePtr ptr
+    return ptr
+
+-- | Cria uma flag atômica
+newAtomicFlag :: SmartPtr a -> HazardPanel a -> IO (AtomicFlag a)
+newAtomicFlag ptr panel = do
+    stamp <- atomicModifyIORef' (hpStamp panel) $ \s -> (s + 1, s)
+    let aptr = AtomicSmartPtr (spRef ptr) stamp (hpCoreId panel)
+    active <- newIORef True
+    let flag = AtomicFlag aptr stamp active
+    atomicModifyIORef' (hpActiveFlags panel) $ \flags -> (flag : flags, ())
+    return flag
+
+-- | Limpa uma flag
+clearAtomicFlag :: AtomicFlag a -> IO ()
+clearAtomicFlag flag = do
+    writeIORef (afActive flag) False
+
+-- | Load seguro
+loadSmartPtr :: SmartPtr a -> IO (Maybe a)
+loadSmartPtr ptr = do
+    panel <- getCurrentPanel
+    flag <- newAtomicFlag ptr panel
+    val <- readIORef (spRef ptr)
+    isAlive <- isPtrAlive ptr  -- Verifica ANTES de limpar
+    clearAtomicFlag flag
+    if isAlive
+        then return (Just val)
+        else return Nothing
+
+-- | Retira um ponteiro
+retirePtr :: SmartPtr a -> IO ()
+retirePtr ptr = do
+    panel <- getCurrentPanel
+    era <- readIORef (hpLocalEra panel)
+    let node = RetiredNode ptr era (spStamp ptr)
+    atomicModifyIORef' (hpRetiredList panel) $ \list -> (node : list, ())
+    tryReclaim panel
+
+-- | Tenta reclamar memória
+tryReclaim :: HazardPanel a -> IO ()
+tryReclaim panel = do
+    allFlags <- getAllActiveFlags
+    retiredList <- readIORef (hpRetiredList panel)
+    let (freeable, protected) = partitionRetired retiredList allFlags
+    mapM_ freeNode freeable
+    writeIORef (hpRetiredList panel) protected
+  where
+    partitionRetired nodes flags =
+        let flagSet = foldl' (\s f -> insert (afStamp f) s) empty flags
+            isProtected node = member (rnStamp node) flagSet
+        in partition isProtected nodes
+    
+    freeNode node = do
+        let ptr = rnPtr node
+        performGC
+        return ()
+
+-- | Pega todas as flags ativas
+getAllActiveFlags :: IO [AtomicFlag a]
+getAllActiveFlags = do
+    let panelIndices = indices panels
+    flags <- forM panelIndices $ \i -> do
+        let panel = panels ! i
+        activeFlags <- readIORef (hpActiveFlags panel)
+        active <- filterM (\f -> readIORef (afActive f)) activeFlags
+        return active
+    return (concat flags)
+
+-- ================================================================
+-- USER-FACING FUNCTIONS
+-- ================================================================
+
+newHazardPtr :: a -> IO (HazardPtr a)
+newHazardPtr value = do
+    ptr <- newSmartPtr value
+    return (HazardPtr ptr)
+
+loadHazardPtr :: HazardPtr a -> IO (Maybe a)
+loadHazardPtr (HazardPtr ptr) = loadSmartPtr ptr
+
+storeHazardPtr :: HazardPtr a -> a -> IO ()
+storeHazardPtr (HazardPtr ptr) value = do
+    writeIORef (spRef ptr) value
+
+duplicateHazardPtr :: HazardPtr a -> IO (HazardPtr a)
+duplicateHazardPtr (HazardPtr ptr) = do
+    val <- readIORef (spRef ptr)
+    newHazardPtr val
+
+-- ================================================================
+-- EXEMPLOS
+-- ================================================================
+
+exampleUsage :: IO ()
+exampleUsage = do
+    putStrLn "=== Halide Hazard Panels Example ==="
+    ptr <- newHazardPtr (42 :: Int)
+    
+    val <- loadHazardPtr ptr
+    case val of
+        Just v -> putStrLn $ "Loaded value: " ++ show v
+        Nothing -> putStrLn "Pointer was freed!"
+    
+    storeHazardPtr ptr 100
+    val2 <- loadHazardPtr ptr
+    case val2 of
+        Just v -> putStrLn $ "Updated value: " ++ show v
+        Nothing -> putStrLn "Pointer was freed!"
+    
+    putStrLn "Concurrent operations..."
+    ptr2 <- newHazardPtr (100 :: Int)
+    ptr3 <- duplicateHazardPtr ptr2
+    val3 <- loadHazardPtr ptr3
+    case val3 of
+        Just v -> putStrLn $ "From duplicated pointer: " ++ show v
+        Nothing -> putStrLn "Duplicated pointer was freed!"
+
+fibonacci :: Int -> IO Int
+fibonacci n = do
+    counter <- newHazardPtr 0
+    let fib 0 = return 0
+        fib 1 = return 1
+        fib x = do
+            a <- fib (x - 1)
+            b <- fib (x - 2)
+            storeHazardPtr counter (a + b)
+            val <- loadHazardPtr counter
+            return $ fromMaybe 0 val
+    fib n
+
+main :: IO ()
+main = do
+    putStrLn "=== Halide Language - Hazard Panels Prototype ==="
+    putStrLn "⚠️  EARLY PROTOTYPE - NOT PRODUCTION READY"
+    putStrLn "📱 Developed on an Android tablet"
+    putStrLn "🤝 Contributors welcome!"
+    putStrLn ""
+    exampleUsage
+    putStrLn ""
+    putStrLn "=== Running Fibonacci ==="
+    result <- fibonacci 10
+    putStrLn $ "Fibonacci(10) = " ++ show result
+    putStrLn ""
+    putStrLn "=== All done! ==="
+
