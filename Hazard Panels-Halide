@@ -1,0 +1,75 @@
+loadSmartPtr :: SmartPtr a -> IO (Maybe a)
+loadSmartPtr ptr = do
+    panel <- getCurrentPanel
+    flag <- newAtomicFlag ptr panel   
+    val <- readIORef (spRef ptr)     
+    clearAtomicFlag flag              
+    isAlive <- isPtrAlive ptr         
+    return $ if isAlive then Just val else Nothing
+newHazardPtr :: a -> IO (HazardPtr a)
+newHazardPtr value = do
+    panel <- getCurrentPanel          
+    ref <- newIORef value             
+    stamp <- nextStamp panel          
+    let ptr = SmartPtr ref stamp panelId
+    addFinalizer ptr $ retirePtr ptr  
+    return $ HazardPtr ptr
+# Hazard Panels: A New Memory Reclamation System
+
+## Inspiration
+- Monitors (Java)
+- TVAR (Haskell)
+- Hazard Eras (2022)
+
+## Problem
+Traditional Hazard Pointers require manual registration.
+This is error-prone and annoying.
+
+## Solution: Hazard Panels
+- One panel per CPU core
+- Atomic flags (not STM)
+- Automatic cleanup via lexical destructors
+
+## How It Works
+1. Each core has a panel
+2. Threads use current core's panel
+3. CAS operations for flags
+4. No manual registration needed!
+
+## Advantages
+- Zero contention (per-core panels)
+- Faster than STM (CAS only)
+- Automatic (no manual work)
+- Safe (flags prevent use-after-free)
+
+## Novelty
+This is a new combination of:
+- Hazard Pointers (2002)
+- Hazard Eras (2022)
+- TVAR + Monitors (2005-2010)
+
+## Status
+- Prototype in Haskell
+- Not yet tested in production
+- Looking for contributors
+data AtomicFlag a = AtomicFlag
+    { afPtr    :: !(AtomicSmartPtr a)  
+    , afStamp  :: !Word32              
+    , afActive :: !(IORef Bool)         
+    }
+loadSmartPtr :: SmartPtr a -> IO (Maybe a)
+loadSmartPtr ptr = do
+    panel <- getCurrentPanel          -- Get this core's panel
+    flag <- newAtomicFlag ptr panel   -- Create protection flag (CAS)
+    val <- readIORef (spRef ptr)      -- Read the value (Acquire)
+    clearAtomicFlag flag              -- Clear protection (Release)
+    isAlive <- isPtrAlive ptr         
+    return $ if isAlive then Just val else Nothing
+newHazardPtr :: a -> IO (HazardPtr a)
+newHazardPtr value = do
+    panel <- getCurrentPanel          -- Get core's panel
+    ref <- newIORef value             -- Allocate memory
+    stamp <- nextStamp panel          -- Unique stamp
+    let ptr = SmartPtr ref stamp panelId
+    addFinalizer ptr $ retirePtr ptr  -- Auto cleanup!
+    return $ HazardPtr ptr
